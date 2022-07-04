@@ -2,38 +2,55 @@ package guiche
 
 import (
 	"context"
+	"time"
 
 	"github.com/bookrun-go/guiche/glog"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 )
 
 type Runner struct {
-	id        string
-	msgChan   chan *KMessage
-	handle    Handle
-	newHandle func() Handle
-	logger    glog.Logger
+	// 外面传进来的
+	newHandle  func() Handle
+	logger     glog.Logger
+	delKeyChan chan *delKey
 
-	closed bool
+	// 根据接收到的参数随时变化
+	id     string
+	handle Handle
+
+	// 创建时初始化
+	closedChane chan bool
+	msgChan     chan *KMessage
+}
+
+func NewRunner(newHandle func() Handle, logger glog.Logger, delKeyChan chan *delKey) *Runner {
+	r := &Runner{
+		newHandle:  newHandle,
+		logger:     logger,
+		delKeyChan: delKeyChan,
+
+		closedChane: make(chan bool),
+		msgChan:     make(chan *KMessage, 100),
+	}
+
+	go r.run()
+
+	return r
 }
 
 func (r *Runner) Accept(ctx context.Context, msg *kafka.Message) {
 	r.msgChan <- &KMessage{ctx: ctx, msg: msg}
 }
 
-func (r *Runner) IsClosed(ctx context.Context) bool {
-	return r.closed
-}
-
 func (r *Runner) Close(ctx context.Context) {
 	close(r.msgChan)
+	<-r.closedChane
 }
 
 func (r *Runner) run() {
 	defer func() {
-		r.closed = true
+		r.closedChane <- true
 	}()
-
 	isEnd := false
 	for msg := range r.msgChan {
 		if msg == nil {
@@ -41,7 +58,8 @@ func (r *Runner) run() {
 			continue
 		}
 
-		if string(msg.msg.Key) != r.id {
+		id := string(msg.msg.Key)
+		if id != r.id {
 			if r.handle != nil { // 关闭前一个handle
 				err := r.handle.Close()
 				if err != nil {
@@ -49,7 +67,9 @@ func (r *Runner) run() {
 				}
 			}
 
+			r.delKeyChan <- &delKey{key: id, delTime: time.Now()}
 			r.handle = r.newHandle()
+			r.id = id
 		}
 
 		end, err := r.handle.Accept(msg.ctx, msg.msg.Key, msg.msg.Value)
